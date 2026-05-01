@@ -32,6 +32,15 @@ def load_models():
 
     return model, scaler, results
 
+# Helper to load full dataset for analysis (with cache)
+@st.cache_data
+def load_full_data():
+    try:
+        filepath = "/Users/sagarsamrat/Downloads/powerdemand_5min_2021_to_2024_with weather.csv"
+        return pd.read_csv(filepath, parse_dates=['datetime'], index_col='datetime')
+    except Exception:
+        return None
+
 # Helper to load sample data for charts
 @st.cache_data
 def load_data():
@@ -39,6 +48,56 @@ def load_data():
         return pd.read_csv('cleaned_data_sample.csv', parse_dates=['datetime'], index_col='datetime')
     except Exception as e:
         return None
+
+@st.cache_data
+def make_prediction_comparison_yearly(df, _model, _scaler):
+    """Generate yearly actual vs predicted comparison"""
+    feature_cols = ['temp', 'rhum', 'wspd', 'hour', 'day', 'month', 'weekday', 'lag_24', 'lag_288', 'rolling_mean_12']
+    df_work = df.copy()
+    
+    # Ensure datetime index exists
+    if not isinstance(df_work.index, pd.DatetimeIndex):
+        df_work.index = pd.to_datetime(df_work.index)
+    
+    # Regenerate features if missing
+    if 'hour' not in df_work.columns:
+        df_work['hour'] = df_work.index.hour
+    if 'day' not in df_work.columns:
+        df_work['day'] = df_work.index.day
+    if 'month' not in df_work.columns:
+        df_work['month'] = df_work.index.month
+    if 'year' not in df_work.columns:
+        df_work['year'] = df_work.index.year
+    if 'weekday' not in df_work.columns:
+        df_work['weekday'] = df_work.index.weekday
+    if 'lag_24' not in df_work.columns:
+        df_work['lag_24'] = df_work['Power demand'].shift(24)
+    if 'lag_288' not in df_work.columns:
+        df_work['lag_288'] = df_work['Power demand'].shift(288)
+    if 'rolling_mean_12' not in df_work.columns:
+        df_work['rolling_mean_12'] = df_work['Power demand'].shift(24).rolling(window=12).mean()
+    
+    # Drop rows with missing values
+    df_clean = df_work.dropna(subset=feature_cols + ['Power demand']).copy()
+    
+    if df_clean.empty or len(df_clean) == 0:
+        raise ValueError(f'No valid data available after feature engineering. Required features: {feature_cols}')
+    
+    # Make predictions for all available data
+    X = df_clean[feature_cols]
+    X_scaled = _scaler.transform(X)
+    preds = _model.predict(X_scaled)
+    
+    df_result = df_clean[['Power demand']].copy()
+    df_result['Predicted demand'] = preds
+    
+    # Monthly aggregation for yearly view
+    df_monthly = df_result.resample('MS').mean()  # Monthly Start
+    df_monthly['Year'] = df_monthly.index.year
+    df_monthly['Month'] = df_monthly.index.month
+    df_monthly['Month_Num'] = df_monthly.index.strftime('%b')
+    
+    return df_monthly
 
 @st.cache_data
 def make_prediction_comparison(df, _model, _scaler):
@@ -86,8 +145,7 @@ page = st.sidebar.radio("Select a Module:",
                          "📊 Data Visualization", 
                          "🔮 Prediction Page", 
                          "📈 Model Performance",
-                         "💻 Pipeline Source Code",
-                         "🚀 Run Pipeline Live"])
+                         "💻 Pipeline Source Code"])
 
 # Contexts
 if page == "🏠 Home Page":
@@ -109,275 +167,223 @@ if page == "🏠 Home Page":
 
 elif page == "📊 Data Visualization":
     st.title("📊 Historical Data Insights & Analysis")
-    df = load_data()
     
-    if df is not None:
+    # Try to load full dataset first for seasonal analysis
+    df_full = load_full_data()
+    df_sample = load_data()
+    
+    if df_sample is not None:
         st.write("Sample of Cleaned Data:")
-        st.dataframe(df.head(10))
-        
-        # === SECTION 1: TREND ANALYSIS ===
+        st.dataframe(df_sample.head(10))
+    
+    # Use full data for seasonal pattern if available, otherwise use sample
+    df_for_analysis = df_full if df_full is not None else df_sample
+    
+    if df_for_analysis is not None:
         st.markdown("---")
-        st.header("📈 1. DEMAND TREND & TIME SERIES ANALYSIS")
+        st.header("🌦️ Seasonal Pattern - Yearly Analysis")
+        st.markdown("**Monthly average power demand showing seasonal patterns across years.**")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("📉 Power Demand Over Time (Full Dataset)")
-            fig1 = px.line(df, x=df.index, y='Power demand', 
-                           title="Complete Power Demand Trend", 
-                           template="plotly_white",
-                           labels={'Power demand': 'Demand (MW)', 'datetime': 'DateTime'})
-            fig1.update_layout(hovermode='x unified', height=400)
-            st.plotly_chart(fig1, use_container_width=True)
+        # Prepare data for seasonal analysis
+        df_analysis = df_for_analysis.copy()
+        df_analysis['Year'] = df_analysis.index.year.astype(str)
+        df_analysis['Month'] = df_analysis.index.month
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
         
-        with col2:
-            st.subheader("📊 Demand Distribution")
-            fig_dist = px.histogram(df, x='Power demand', nbins=50,
-                                   title="Distribution of Power Demand",
-                                   template="plotly_white",
-                                   labels={'Power demand': 'Demand (MW)', 'count': 'Frequency'})
-            fig_dist.update_layout(height=400)
-            st.plotly_chart(fig_dist, use_container_width=True)
+        # Group by Year and Month to get average demand
+        seasonal_data = df_analysis.groupby(['Year', 'Month'])['Power demand'].agg(['mean', 'min', 'max']).reset_index()
+        seasonal_data['Month_Name'] = seasonal_data['Month'].map(lambda x: month_names[x-1])
         
-        # === SECTION 2: HOURLY PATTERNS ===
+        # Create line chart for seasonal patterns
+        fig_seasonal = px.line(seasonal_data, 
+                               x='Month', 
+                               y='mean', 
+                               color='Year',
+                               markers=True,
+                               title='Seasonal Pattern: Monthly Average Power Demand by Year',
+                               labels={'mean': 'Avg Demand (MW)', 'Month': 'Month'},
+                               template='plotly_white',
+                               line_shape='spline')
+        
+        fig_seasonal.update_xaxes(
+            ticktext=month_names,
+            tickvals=list(range(1, 13))
+        )
+        fig_seasonal.update_layout(
+            height=500,
+            hovermode='x unified',
+            plot_bgcolor='rgba(240,240,240,0.5)',
+            xaxis_title='Month',
+            yaxis_title='Average Power Demand (MW)',
+            legend=dict(title='Year', orientation='v')
+        )
+        fig_seasonal.update_traces(line=dict(width=2.5), marker=dict(size=8))
+        
+        st.plotly_chart(fig_seasonal, use_container_width=True)
+        
+        # Show data summary
         st.markdown("---")
-        st.header("⏰ 2. HOURLY DEMAND PATTERNS (24-HOUR CYCLES)")
+        st.header("📊 Yearly Seasonal Summary")
+        summary_table = seasonal_data.groupby('Year').agg({
+            'mean': ['min', 'max', 'mean']
+        }).round(2)
+        summary_table.columns = ['Min Demand (MW)', 'Max Demand (MW)', 'Avg Demand (MW)']
+        st.dataframe(summary_table, use_container_width=True)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            hourly_avg = df.groupby(df.index.hour)['Power demand'].agg(['mean', 'std', 'min', 'max']).reset_index()
-            hourly_avg.columns = ['Hour', 'Mean', 'Std Dev', 'Min', 'Max']
-            fig_hourly = px.line(hourly_avg, x='Hour', y=['Mean', 'Min', 'Max'],
-                                 title="Average Demand by Hour of Day",
-                                 template="plotly_white",
-                                 labels={'value': 'Demand (MW)', 'variable': 'Metric'})
-            fig_hourly.update_layout(height=400)
-            st.plotly_chart(fig_hourly, use_container_width=True)
-        
-        with col2:
-            fig_hourly_box = px.box(df.reset_index(), x=df.reset_index()[df.index.name].dt.hour, 
-                                    y='Power demand',
-                                    title="Demand Distribution by Hour",
-                                    template="plotly_white",
-                                    labels={'Hour': 'Hour of Day', 'Power demand': 'Demand (MW)'})
-            fig_hourly_box.update_xaxes(title_text="Hour of Day")
-            fig_hourly_box.update_layout(height=400)
-            st.plotly_chart(fig_hourly_box, use_container_width=True)
-        
-        # === SECTION 3: WEEKLY & DAILY PATTERNS ===
+        # === ACTUAL VS PREDICTED YEARLY ===
         st.markdown("---")
-        st.header("📅 3. WEEKLY & DAILY PATTERNS")
+        st.header("🤖 Actual vs Predicted Demand - Yearly View")
+        st.markdown("**Comparing actual power demand with model predictions on a monthly basis across years.**")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            daily_avg = df.groupby(df.index.weekday)['Power demand'].mean().reset_index()
-            day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-            daily_avg['Day'] = daily_avg['datetime'].map(lambda x: day_names[x])
-            fig_daily = px.bar(daily_avg, x='Day', y='Power demand',
-                              title="Average Demand by Day of Week",
-                              template="plotly_white",
-                              labels={'Power demand': 'Demand (MW)'})
-            fig_daily.update_layout(height=400)
-            st.plotly_chart(fig_daily, use_container_width=True)
-        
-        with col2:
-            df_copy = df.reset_index()
-            df_copy['DayOfMonth'] = df_copy['datetime'].dt.day
-            daily_of_month = df_copy.groupby('DayOfMonth')['Power demand'].mean().reset_index()
-            fig_dom = px.line(daily_of_month, x='DayOfMonth', y='Power demand',
-                             title="Average Demand by Day of Month",
-                             template="plotly_white",
-                             labels={'Power demand': 'Demand (MW)', 'DayOfMonth': 'Day of Month'},
-                             markers=True)
-            fig_dom.update_layout(height=400)
-            st.plotly_chart(fig_dom, use_container_width=True)
-        
-        # === SECTION 4: SEASONAL & MONTHLY PATTERNS ===
-        st.markdown("---")
-        st.header("🌞 4. SEASONAL & MONTHLY TRENDS")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            monthly_avg = df.groupby(df.index.month)['Power demand'].agg(['mean', 'min', 'max']).reset_index()
-            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            monthly_avg['Month'] = monthly_avg['datetime'].map(lambda x: month_names[x-1] if x <= 12 else 'Unknown')
-            fig_monthly = px.bar(monthly_avg, x='Month', y='mean',
-                                title="Average Demand by Month",
-                                template="plotly_white",
-                                labels={'mean': 'Demand (MW)'})
-            fig_monthly.update_layout(height=400)
-            st.plotly_chart(fig_monthly, use_container_width=True)
-        
-        with col2:
-            fig_seasonal_box = px.box(df.reset_index(), x=df.reset_index()[df.index.name].dt.month,
-                                      y='Power demand',
-                                      title="Demand Variability by Month",
-                                      template="plotly_white",
-                                      labels={'Power demand': 'Demand (MW)', 'datetime': 'Month'})
-            fig_seasonal_box.update_xaxes(title_text="Month")
-            fig_seasonal_box.update_layout(height=400)
-            st.plotly_chart(fig_seasonal_box, use_container_width=True)
-        
-        # === SECTION 5: WEATHER IMPACTS ===
-        st.markdown("---")
-        st.header("🌡️ 5. WEATHER CORRELATIONS WITH DEMAND")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            fig_temp = px.scatter(df, x='temp', y='Power demand', color='hour',
-                                 title="Temperature Impact on Demand",
-                                 template="plotly_white",
-                                 labels={'temp': 'Temperature (°C)', 'Power demand': 'Demand (MW)'},
-                                 color_continuous_scale="RdYlBu_r",
-                                 opacity=0.6)
-            fig_temp.update_layout(height=400)
-            st.plotly_chart(fig_temp, use_container_width=True)
-        
-        with col2:
-            fig_humidity = px.scatter(df, x='rhum', y='Power demand', color='temp',
-                                     title="Humidity Impact on Demand",
-                                     template="plotly_white",
-                                     labels={'rhum': 'Humidity (%)', 'Power demand': 'Demand (MW)', 'temp': 'Temp (°C)'},
-                                     color_continuous_scale="Viridis",
-                                     opacity=0.6)
-            fig_humidity.update_layout(height=400)
-            st.plotly_chart(fig_humidity, use_container_width=True)
-        
-        with col3:
-            fig_wind = px.scatter(df, x='wspd', y='Power demand', color='rhum',
-                                 title="Wind Speed Impact on Demand",
-                                 template="plotly_white",
-                                 labels={'wspd': 'Wind Speed', 'Power demand': 'Demand (MW)', 'rhum': 'Humidity (%)'},
-                                 color_continuous_scale="Plasma",
-                                 opacity=0.6)
-            fig_wind.update_layout(height=400)
-            st.plotly_chart(fig_wind, use_container_width=True)
-        
-        # === SECTION 6: CORRELATION HEATMAP ===
-        st.markdown("---")
-        st.header("🔗 6. FEATURE CORRELATION ANALYSIS")
-        
-        corr_matrix = df[['Power demand', 'temp', 'rhum', 'wspd', 'hour', 'day', 'month', 'weekday']].corr()
-        fig_corr = px.imshow(corr_matrix, text_auto='.2f',
-                            title="Feature Correlation Heatmap",
-                            template="plotly_white",
-                            color_continuous_scale="RdBu",
-                            zmin=-1, zmax=1)
-        fig_corr.update_layout(height=500)
-        st.plotly_chart(fig_corr, use_container_width=True)
-        
-        # === SECTION 7: LAG ANALYSIS ===
-        st.markdown("---")
-        st.header("⏱️ 7. LAG FEATURES ANALYSIS")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            fig_lag24 = px.scatter(df, x='lag_24', y='Power demand',
-                                  title="2-Hour Lag vs Current Demand",
-                                  template="plotly_white",
-                                  labels={'lag_24': 'Power 2hrs ago (MW)', 'Power demand': 'Current Demand (MW)'},
-                                  opacity=0.5)
-            fig_lag24.update_layout(height=400)
-            st.plotly_chart(fig_lag24, use_container_width=True)
-        
-        with col2:
-            fig_lag288 = px.scatter(df, x='lag_288', y='Power demand',
-                                   title="24-Hour Lag vs Current Demand",
-                                   template="plotly_white",
-                                   labels={'lag_288': 'Power 24hrs ago (MW)', 'Power demand': 'Current Demand (MW)'},
-                                   color_continuous_scale="Greens",
-                                   opacity=0.5)
-            fig_lag288.update_layout(height=400)
-            st.plotly_chart(fig_lag288, use_container_width=True)
-        
-        with col3:
-            fig_rolling = px.scatter(df, x='rolling_mean_12', y='Power demand',
-                                    title="1-Hour Rolling Mean vs Current Demand",
-                                    template="plotly_white",
-                                    labels={'rolling_mean_12': 'Rolling Mean (MW)', 'Power demand': 'Current Demand (MW)'},
-                                    color_continuous_scale="Oranges",
-                                    opacity=0.5)
-            fig_rolling.update_layout(height=400)
-            st.plotly_chart(fig_rolling, use_container_width=True)
-        
-        # === SECTION 8: MODEL PREDICTIONS ===
-        model, scaler, results = load_models()
+        model, scaler, _ = load_models()
         if model is not None and scaler is not None:
-            st.markdown("---")
-            st.header("🤖 8. MODEL PERFORMANCE & PREDICTIONS")
-            
             try:
-                comparison_df = make_prediction_comparison(df, model, scaler)
+                pred_monthly = make_prediction_comparison_yearly(df_for_analysis, model, scaler)
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_pred = px.line(comparison_df,
-                                      y=['Power demand', 'Predicted demand'],
-                                      title='Actual vs Predicted Demand (Monthly Average)',
-                                      labels={'value': 'Demand (MW)', 'variable': 'Series'},
-                                      template='plotly_white',
-                                      markers=True)
-                    fig_pred.update_layout(hovermode='x unified', height=400)
-                    st.plotly_chart(fig_pred, use_container_width=True)
+                # Create line chart with both actual and predicted
+                fig_actual_pred = go.Figure()
                 
-                with col2:
-                    rmse = np.sqrt(np.mean((comparison_df['Power demand'] - comparison_df['Predicted demand']) ** 2))
-                    mae = np.mean(np.abs(comparison_df['Power demand'] - comparison_df['Predicted demand']))
-                    residuals = comparison_df['Power demand'] - comparison_df['Predicted demand']
-                    
-                    comparison_df['Residuals'] = residuals
-                    fig_residual = px.line(comparison_df, y='Residuals',
-                                          title='Prediction Residuals Over Time',
-                                          template='plotly_white',
-                                          labels={'Residuals': 'Error (MW)'})
-                    fig_residual.add_hline(y=0, line_dash="dash", line_color="red")
-                    fig_residual.update_layout(height=400, hovermode='x unified')
-                    st.plotly_chart(fig_residual, use_container_width=True)
+                # Add actual demand line
+                fig_actual_pred.add_trace(go.Scatter(
+                    x=pred_monthly.index,
+                    y=pred_monthly['Power demand'],
+                    mode='lines+markers',
+                    name='Actual Demand',
+                    line=dict(color='#2ecc71', width=2.5),
+                    marker=dict(size=6),
+                    hovertemplate='<b>Actual</b><br>Date: %{x|%b %Y}<br>Demand: %{y:.1f} MW<extra></extra>'
+                ))
                 
-                # Model Metrics
+                # Add predicted demand line
+                fig_actual_pred.add_trace(go.Scatter(
+                    x=pred_monthly.index,
+                    y=pred_monthly['Predicted demand'],
+                    mode='lines+markers',
+                    name='Predicted Demand',
+                    line=dict(color='#e74c3c', width=2.5, dash='dash'),
+                    marker=dict(size=6),
+                    hovertemplate='<b>Predicted</b><br>Date: %{x|%b %Y}<br>Demand: %{y:.1f} MW<extra></extra>'
+                ))
+                
+                fig_actual_pred.update_layout(
+                    title='Actual vs Predicted Monthly Demand (Yearly View)',
+                    xaxis_title='Month',
+                    yaxis_title='Demand (MW)',
+                    height=500,
+                    hovermode='x unified',
+                    plot_bgcolor='rgba(240,240,240,0.5)',
+                    template='plotly_white',
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                )
+                
+                st.plotly_chart(fig_actual_pred, use_container_width=True)
+                
+                # Calculate and show metrics
+                st.markdown("---")
+                st.header("📈 Model Performance Metrics (Yearly Data)")
+                
+                rmse = np.sqrt(np.mean((pred_monthly['Power demand'] - pred_monthly['Predicted demand']) ** 2))
+                mae = np.mean(np.abs(pred_monthly['Power demand'] - pred_monthly['Predicted demand']))
+                residuals = pred_monthly['Power demand'] - pred_monthly['Predicted demand']
+                
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("📊 RMSE", f"{rmse:.2f} MW")
                 with col2:
                     st.metric("📏 MAE", f"{mae:.2f} MW")
                 with col3:
-                    mape = np.mean(np.abs(residuals / comparison_df['Power demand'])) * 100
+                    mape = np.mean(np.abs(residuals / pred_monthly['Power demand'])) * 100
                     st.metric("🎯 MAPE", f"{mape:.2f}%")
                 with col4:
-                    r2 = 1 - (np.sum(residuals**2) / np.sum((comparison_df['Power demand'] - comparison_df['Power demand'].mean())**2))
+                    r2 = 1 - (np.sum(residuals**2) / np.sum((pred_monthly['Power demand'] - pred_monthly['Power demand'].mean())**2))
                     st.metric("📈 R² Score", f"{r2:.4f}")
                 
+                # Explanation about why R² is higher
+                st.warning("""
+                📌 **Why is R² higher here than validation metrics?**
+                
+                - **Validation R² (XGBoost): 0.9468** - Calculated on individual 5-minute intervals
+                - **Yearly R² (shown above): Often >0.99** - Calculated on monthly aggregated averages
+                
+                **Reason:** Monthly averaging smooths out noise and reduces variance in the data. Predicting smooth monthly averages is easier than predicting individual volatile 5-minute intervals.
+                
+                **True Model Performance:** The validation set metrics (RMSE, MAE, R²) are more representative of real-world performance on raw data.
+                """)
+                
+                # === 2024 MONTHLY FORECAST ===
+                st.markdown("---")
+                st.header("📅 2024 Monthly Forecast - Actual vs Predicted")
+                st.markdown("**Monthly average power demand for 2024 with model predictions vs actual recorded values.**")
+                
+                if os.path.exists('monthly_actual_vs_predicted_2024.png'):
+                    from PIL import Image
+                    img = Image.open('monthly_actual_vs_predicted_2024.png')
+                    st.image(img, use_column_width=True, caption="Monthly Actual vs Predicted Power Demand - 2024")
+                    
+                    # Display 2024 metrics
+                    st.markdown("---")
+                    st.subheader("📊 2024 Forecast Performance Summary")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("🎯 MAE (2024)", "67.21 MW")
+                    with col2:
+                        st.metric("📊 RMSE (2024)", "73.83 MW")
+                    with col3:
+                        st.metric("✅ MAPE (2024)", "1.49%")
+                    
+                    st.info("""
+                    ℹ️ **Note on 2024 Performance Metrics:**
+                    - These metrics are on **monthly aggregated data** (12 data points total)
+                    - This is different from **validation set metrics** which use raw 5-minute intervals (~90K points)
+                    - Aggregated monthly performance is inherently easier to predict than volatile minute-level data
+                    - Compare with **Validation R² (XGBoost): 0.9468** on raw data for true model performance
+                    """)
+                    
+                    # Monthly breakdown table
+                    st.markdown("---")
+                    st.subheader("📋 Month-by-Month Breakdown (2024)")
+                    
+                    months_data = {
+                        'Month': ['January', 'February', 'March', 'April', 'May', 'June', 
+                                 'July', 'August', 'September', 'October', 'November', 'December'],
+                        'Actual (MW)': [4002.89, 3541.57, 3557.99, 4223.68, 5543.26, 5590.68,
+                                       5377.00, 4878.87, 4620.07, 4138.03, 3525.38, 4403.54],
+                        'Predicted (MW)': [3915.13, 3484.90, 3520.99, 4191.44, 5439.54, 5456.09,
+                                          5295.31, 4837.89, 4567.71, 4105.46, 3463.51, 4318.52],
+                        'Difference (MW)': [87.77, 56.68, 37.01, 32.24, 103.72, 134.59,
+                                           81.70, 40.97, 52.36, 32.57, 61.88, 85.02]
+                    }
+                    df_2024_breakdown = pd.DataFrame(months_data)
+                    
+                    # Highlight rows
+                    def highlight_diff(row):
+                        if row['Difference (MW)'] > 100:
+                            return ['background-color: #fff3cd'] * len(row)
+                        elif row['Difference (MW)'] < 40:
+                            return ['background-color: #d4edda'] * len(row)
+                        return [''] * len(row)
+                    
+                    st.dataframe(df_2024_breakdown.style.apply(highlight_diff, axis=1),
+                                use_container_width=True)
+                    
+                    st.caption("🟡 Yellow = Higher deviation (>100 MW) | 🟢 Green = Lower error (<40 MW)")
+                else:
+                    st.info("📌 2024 monthly forecast graph not yet generated. Run the monthly_forecast_2024.py script to create it.")
+                
             except Exception as e:
-                st.warning(f"Could not generate prediction charts: {str(e)}")
-            
-            # Model Comparison
-            if results is not None:
-                st.subheader("Model Comparison")
-                results_df = pd.DataFrame(results).T
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_rmse_comp = px.bar(results_df.reset_index(), x='index', y='RMSE',
-                                          title='Model Comparison - RMSE (Lower is Better)',
-                                          labels={'index': 'Model', 'RMSE': 'RMSE (MW)'},
-                                          template='plotly_white',
-                                          color='RMSE',
-                                          color_continuous_scale='Reds')
-                    fig_rmse_comp.update_layout(height=400)
-                    st.plotly_chart(fig_rmse_comp, use_container_width=True)
-                
-                with col2:
-                    fig_r2_comp = px.bar(results_df.reset_index(), x='index', y='R2',
-                                        title='Model Comparison - R² Score (Higher is Better)',
-                                        labels={'index': 'Model', 'R2': 'R2 Score'},
-                                        template='plotly_white',
-                                        color='R2',
-                                        color_continuous_scale='Greens')
-                    fig_r2_comp.update_layout(height=400)
-                    st.plotly_chart(fig_r2_comp, use_container_width=True)
-        else:
-            st.info("ℹ️ Model artifacts not available for prediction comparison. Run `ml_pipeline.py` first.")
+                st.error(f"⚠️ Could not generate yearly comparison chart: {str(e)}")
+                st.info("💡 This may happen if the dataset doesn't have enough valid records after feature engineering. Try refreshing the page or check that all data files are present.")
+        
+    elif df_sample is not None:
+        st.markdown("---")
+        st.header("📊 Data Summary Statistics")
+        st.warning("⚠️ Full dataset not found. Showing sample data statistics only.")
+        st.write("**Basic Statistics:**")
+        st.dataframe(df_sample.describe())
+        
     else:
-        st.warning("⚠️ Cleaned data sample not found. Please run `ml_pipeline.py` first.")
+        st.warning("⚠️ Data not found. Please run `ml_pipeline.py` first.")
 
 elif page == "🔮 Prediction Page":
     st.title("🔮 Demand Prediction Engine")
@@ -439,6 +445,7 @@ elif page == "🔮 Prediction Page":
 
 elif page == "📈 Model Performance":
     st.title("📈 Model Selection & Performance Analysis")
+    st.markdown("**Comprehensive model performance comparison across all evaluation metrics.**")
     
     _, _, results = load_models()
     
@@ -452,79 +459,75 @@ elif page == "📈 Model Performance":
                      use_container_width=True)
         
         st.markdown("---")
-        st.header("📊 Detailed Performance Metrics")
+        st.header("📊 Performance Visualizations")
         
+        # Create 3 columns for metric charts
         col1, col2, col3 = st.columns(3)
         
-        # RMSE Comparison
+        # 1. RMSE Comparison
         with col1:
-            fig_rmse = px.bar(df_metrics.reset_index(), x='index', y='RMSE',
-                             title='Root Mean Squared Error (RMSE)',
-                             labels={'index': 'Model', 'RMSE': 'RMSE (MW)'},
-                             template='plotly_white',
-                             color='RMSE',
-                             color_continuous_scale='Reds')
-            fig_rmse.update_layout(height=400, showlegend=False)
-            fig_rmse.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_rmse, use_container_width=True)
-        
-        # MAE Comparison
-        with col2:
-            fig_mae = px.bar(df_metrics.reset_index(), x='index', y='MAE',
-                            title='Mean Absolute Error (MAE)',
-                            labels={'index': 'Model', 'MAE': 'MAE (MW)'},
-                            template='plotly_white',
-                            color='MAE',
-                            color_continuous_scale='Blues')
-            fig_mae.update_layout(height=400, showlegend=False)
-            fig_mae.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_mae, use_container_width=True)
-        
-        # R2 Score Comparison
-        with col3:
-            fig_r2 = px.bar(df_metrics.reset_index(), x='index', y='R2',
-                           title='R² Score (Coefficient of Determination)',
-                           labels={'index': 'Model', 'R2': 'R² Score'},
-                           template='plotly_white',
-                           color='R2',
-                           color_continuous_scale='Greens')
-            fig_r2.update_layout(height=400, showlegend=False)
-            fig_r2.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_r2, use_container_width=True)
-        
-        st.markdown("---")
-        
-        # Combined comparison chart
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig_combined = go.Figure()
-            fig_combined.add_trace(go.Bar(name='RMSE', x=df_metrics.index, y=df_metrics['RMSE'], marker_color='#ef4444'))
-            fig_combined.add_trace(go.Bar(name='MAE', x=df_metrics.index, y=df_metrics['MAE'], marker_color='#3b82f6'))
-            fig_combined.update_layout(
-                title='Error Metrics Comparison (RMSE vs MAE)',
-                barmode='group',
-                template='plotly_white',
-                height=400,
-                xaxis_title='Model',
-                yaxis_title='Error (MW)',
-                hovermode='x unified'
+            fig_rmse = px.bar(
+                x=df_metrics.index,
+                y=df_metrics['RMSE'],
+                title='RMSE Comparison',
+                labels={'x': 'Model', 'y': 'RMSE (MW)'},
+                color=df_metrics['RMSE'],
+                color_continuous_scale='RdYlGn_r',
+                template='plotly_white'
             )
-            fig_combined.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_combined, use_container_width=True)
+            fig_rmse.update_layout(
+                height=400,
+                showlegend=False,
+                yaxis_title='RMSE (MW)',
+                xaxis_title='Model'
+            )
+            fig_rmse.update_xaxes(tickangle=-45)
+            st.plotly_chart(fig_rmse, use_container_width=True)
+            st.caption("🔴 Lower is better - penalizes large errors")
         
+        # 2. MAE Comparison
         with col2:
-            # R2 Score visualization with annotations
-            fig_r2_line = px.line(df_metrics.reset_index(), x='index', y='R2',
-                                 title='R² Score Across Models',
-                                 labels={'index': 'Model', 'R2': 'R² Score'},
-                                 template='plotly_white',
-                                 markers=True,
-                                 line_shape='spline')
-            fig_r2_line.update_traces(line=dict(width=3), marker=dict(size=10))
-            fig_r2_line.update_layout(height=400)
-            fig_r2_line.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_r2_line, use_container_width=True)
+            fig_mae = px.bar(
+                x=df_metrics.index,
+                y=df_metrics['MAE'],
+                title='MAE Comparison',
+                labels={'x': 'Model', 'y': 'MAE (MW)'},
+                color=df_metrics['MAE'],
+                color_continuous_scale='RdYlGn_r',
+                template='plotly_white'
+            )
+            fig_mae.update_layout(
+                height=400,
+                showlegend=False,
+                yaxis_title='MAE (MW)',
+                xaxis_title='Model'
+            )
+            fig_mae.update_xaxes(tickangle=-45)
+            st.plotly_chart(fig_mae, use_container_width=True)
+            st.caption("🔴 Lower is better - average absolute error")
+        
+        # 3. R² Score Comparison
+        with col3:
+            fig_r2 = px.bar(
+                x=df_metrics.index,
+                y=df_metrics['R2'],
+                title='R² Score Comparison',
+                labels={'x': 'Model', 'y': 'R² Score'},
+                color=df_metrics['R2'],
+                color_continuous_scale='YlGn',
+                template='plotly_white'
+            )
+            fig_r2.update_layout(
+                height=400,
+                showlegend=False,
+                yaxis_title='R² Score',
+                xaxis_title='Model'
+            )
+            fig_r2.update_xaxes(tickangle=-45)
+            st.plotly_chart(fig_r2, use_container_width=True)
+            st.caption("🟢 Higher is better - variance explained")
+        
+
         
         st.markdown("---")
         st.header("📈 Model Rankings & Insights")
@@ -552,37 +555,6 @@ elif page == "📈 Model Performance":
             st.metric(best_mae_model, f"{best_mae_value:.2f} MW", delta=None)
             st.caption("Lower MAE is better - average error")
         
-        st.markdown("---")
-        st.header("📊 Performance Statistics")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.write("**RMSE Statistics**")
-            st.dataframe({
-                'Statistic': ['Mean', 'Std Dev', 'Min', 'Max', 'Range'],
-                'Value': [
-                    f"{df_metrics['RMSE'].mean():.2f}",
-                    f"{df_metrics['RMSE'].std():.2f}",
-                    f"{df_metrics['RMSE'].min():.2f}",
-                    f"{df_metrics['RMSE'].max():.2f}",
-                    f"{df_metrics['RMSE'].max() - df_metrics['RMSE'].min():.2f}"
-                ]
-            }, use_container_width=True)
-        
-        with col2:
-            st.write("**R² Statistics**")
-            st.dataframe({
-                'Statistic': ['Mean', 'Std Dev', 'Min', 'Max', 'Range'],
-                'Value': [
-                    f"{df_metrics['R2'].mean():.4f}",
-                    f"{df_metrics['R2'].std():.4f}",
-                    f"{df_metrics['R2'].min():.4f}",
-                    f"{df_metrics['R2'].max():.4f}",
-                    f"{df_metrics['R2'].max() - df_metrics['R2'].min():.4f}"
-                ]
-            }, use_container_width=True)
-        
         best_model = df_metrics['RMSE'].idxmin()
         st.markdown("---")
         st.success(f"🏆 **Selected Model:** {best_model} achieved the best performance with the lowest Root Mean Squared Error (RMSE: {df_metrics.loc[best_model, 'RMSE']:.2f} MW)")
@@ -590,61 +562,42 @@ elif page == "📈 Model Performance":
         st.warning("⚠️ Evaluation metrics not found. Run the training script first.")
 
 elif page == "💻 Pipeline Source Code":
-    st.title("💻 Pipeline Source Code")
-    st.markdown("This page displays the Python code used for the entire Data Cleaning, Feature Engineering, and Modeling process.")
+    st.title("💻 Pipeline Source Code & Notebook Comparison")
+    st.markdown("This page displays the Python code used for the entire Data Cleaning, Feature Engineering, and Modeling process. You can natively compare the structured **Production Script** against the simplified **Jupyter Notebook**!")
     
-    try:
-        with open('ml_pipeline.py', 'r') as f:
-            code = f.read()
-        st.code(code, language='python')
-    except FileNotFoundError:
-        st.error("⚠️ `ml_pipeline.py` file not found.")
+    tab1, tab2 = st.tabs(["🐍 Production Script (ml_pipeline.py)", "📓 Interactive Notebook (ML_Pipeline_Interactive.ipynb)"])
+    
+    with tab1:
+        st.markdown("### 🐍 Production Pipeline Script")
+        st.info("This is the highly robust, modularized Python script used for automated execution in server environments.")
+        try:
+            with open('ml_pipeline.py', 'r') as f:
+                code = f.read()
+            st.code(code, language='python')
+        except FileNotFoundError:
+            st.error("⚠️ `ml_pipeline.py` file not found.")
+            
+    with tab2:
+        st.markdown("### 📓 Jupyter Notebook Code Cells")
+        st.info("This extracts all the pure Python Code from the Jupyter Notebook cells. Notice how it is broken down differently with visualizations integrated into the workflow!")
+        try:
+            import json
+            with open('ML_Pipeline_Interactive.ipynb', 'r', encoding='utf-8') as f:
+                nb_data = json.load(f)
+            
+            nb_code = ""
+            cell_count = 1
+            for cell in nb_data.get('cells', []):
+                if cell.get('cell_type') == 'code':
+                    nb_code += f"# {'='*60}\n# 🟢 JUPYTER CODE CELL {cell_count}\n# {'='*60}\n"
+                    source = cell.get('source', [])
+                    if isinstance(source, list):
+                        nb_code += "".join(source) + "\n\n\n"
+                    else:
+                        nb_code += source + "\n\n\n"
+                    cell_count += 1
+            st.code(nb_code, language='python')
+        except Exception as e:
+            st.error(f"⚠️ Could not load `ML_Pipeline_Interactive.ipynb`: {str(e)}")
 
-elif page == "🚀 Run Pipeline Live":
-    st.title("🚀 Run Pipeline Live")
-    st.markdown("Execute the complete Machine Learning pipeline—Data Cleaning, Feature Engineering, and Modeling—directly from the UI.")
-    
-    if st.button("▶️ Start Pipeline Execution", type="primary"):
-        import ml_pipeline
-        filepath = "/Users/sagarsamrat/Downloads/powerdemand_5min_2021_to_2024_with weather.csv"
-        
-        if not os.path.exists(filepath):
-            st.error(f"Dataset not found at {filepath}")
-        else:
-            with st.status("Executing Machine Learning Pipeline...", expanded=True) as status:
-                st.write("📥 **1. Loading data...**")
-                df = ml_pipeline.load_data(filepath)
-                st.write(f"Data loaded successfully: {df.shape[0]} rows, {df.shape[1]} columns.")
-                
-                st.write("🧹 **2. Cleaning data...**")
-                df = ml_pipeline.clean_data(df)
-                st.write("Data cleaned (duplicates removed, outliers handled, missing values interpolated).")
-                
-                st.write("⚙️ **3. Engineering features...**")
-                df = ml_pipeline.engineer_features(df)
-                st.write(f"Time-based and lag features created. New shape: {df.shape[0]} rows, {df.shape[1]} columns.")
-                
-                st.write("✂️ **4. Splitting data...**")
-                X_train, y_train, X_val, y_val, X_test, y_test, features = ml_pipeline.get_train_val_test_split(df)
-                st.write(f"Data splitted: Train ({len(X_train)}), Validation ({len(X_val)}), Test ({len(X_test)}).")
-                
-                st.write("🧠 **5. Training Models...** (Linear Regression, Ridge, Random Forest, Gradient Boosting, XGBoost, K-Neighbors) -> *This might take a few minutes.*")
-                best_model, best_name = ml_pipeline.build_models(X_train, y_train, X_val, y_val)
-                st.write(f"✅ **Models trained successfully!** Best model selected: {best_name}.")
-                
-                status.update(label="Pipeline Execution Complete!", state="complete", expanded=False)
-            
-            st.success("Pipeline executed and models saved successfully!")
-            
-            st.subheader("📊 Accuracy & Model Selection")
-            st.markdown("Here is the evaluation of all trained models on the Validation Set:")
-            
-            # Load fresh results
-            load_models.clear()
-            _, _, results = load_models()
-            if results:
-                df_metrics = pd.DataFrame(results).T
-                st.dataframe(df_metrics.style.highlight_min(subset=['RMSE', 'MAE'], color='#059669').highlight_max(subset=['R2'], color='#059669'), use_container_width=True)
-                
-                best_m = df_metrics['RMSE'].idxmin()
-                st.info(f"**🎯 Automatic Selection:** **{best_m}** was officially selected due to obtaining the lowest RMSE score ({df_metrics.loc[best_m, 'RMSE']:.2f}).")
+
