@@ -36,7 +36,7 @@ def load_models():
 @st.cache_data
 def load_full_data():
     try:
-        filepath = "/Users/sagarsamrat/Downloads/powerdemand_5min_2021_to_2024_with weather.csv"
+        filepath = "powerdemand_5min_2021_to_2024_with weather.csv"
         return pd.read_csv(filepath, parse_dates=['datetime'], index_col='datetime')
     except Exception:
         return None
