@@ -37,7 +37,13 @@ def load_models():
 def load_full_data():
     try:
         filepath = "powerdemand_5min_2021_to_2024_with weather.csv"
-        return pd.read_csv(filepath, parse_dates=['datetime'], index_col='datetime')
+        df = pd.read_csv(filepath, parse_dates=['datetime'], index_col='datetime')
+        # Optimize memory usage for Render (512MB limit)
+        for col in df.select_dtypes(include=['float64']).columns:
+            df[col] = df[col].astype('float32')
+        for col in df.select_dtypes(include=['int64']).columns:
+            df[col] = df[col].astype('int32')
+        return df
     except Exception:
         return None
 
@@ -50,46 +56,72 @@ def load_data():
         return None
 
 @st.cache_data
+def load_seasonal_data():
+    if os.path.exists("seasonal_data_precomputed.csv"):
+        try:
+            df = pd.read_csv("seasonal_data_precomputed.csv")
+            df['Year'] = df['Year'].astype(str)
+            return df
+        except Exception:
+            pass
+    return None
+
+@st.cache_data
+def load_yearly_comparison():
+    if os.path.exists("yearly_monthly_comparison.csv"):
+        try:
+            return pd.read_csv("yearly_monthly_comparison.csv", parse_dates=['datetime'], index_col='datetime')
+        except Exception:
+            pass
+    return None
+
+@st.cache_data
 def make_prediction_comparison_yearly(df, _model, _scaler):
     """Generate yearly actual vs predicted comparison"""
     feature_cols = ['temp', 'rhum', 'wspd', 'hour', 'day', 'month', 'weekday', 'lag_24', 'lag_288', 'rolling_mean_12']
-    df_work = df.copy()
+    
+    # Optimize memory: extract only necessary columns instead of full copy
+    needed_cols = [c for c in ['Power demand', 'temp', 'rhum', 'wspd'] if c in df.columns]
+    df_work = df[needed_cols].copy()
     
     # Ensure datetime index exists
     if not isinstance(df_work.index, pd.DatetimeIndex):
         df_work.index = pd.to_datetime(df_work.index)
     
-    # Regenerate features if missing
+    # Regenerate features if missing, using memory efficient types
     if 'hour' not in df_work.columns:
-        df_work['hour'] = df_work.index.hour
+        df_work['hour'] = df_work.index.hour.astype('int8')
     if 'day' not in df_work.columns:
-        df_work['day'] = df_work.index.day
+        df_work['day'] = df_work.index.day.astype('int8')
     if 'month' not in df_work.columns:
-        df_work['month'] = df_work.index.month
+        df_work['month'] = df_work.index.month.astype('int8')
     if 'year' not in df_work.columns:
-        df_work['year'] = df_work.index.year
+        df_work['year'] = df_work.index.year.astype('int16')
     if 'weekday' not in df_work.columns:
-        df_work['weekday'] = df_work.index.weekday
+        df_work['weekday'] = df_work.index.weekday.astype('int8')
     if 'lag_24' not in df_work.columns:
-        df_work['lag_24'] = df_work['Power demand'].shift(24)
+        df_work['lag_24'] = df_work['Power demand'].shift(24).astype('float32')
     if 'lag_288' not in df_work.columns:
-        df_work['lag_288'] = df_work['Power demand'].shift(288)
+        df_work['lag_288'] = df_work['Power demand'].shift(288).astype('float32')
     if 'rolling_mean_12' not in df_work.columns:
-        df_work['rolling_mean_12'] = df_work['Power demand'].shift(24).rolling(window=12).mean()
+        df_work['rolling_mean_12'] = df_work['Power demand'].shift(24).rolling(window=12).mean().astype('float32')
     
-    # Drop rows with missing values
-    df_clean = df_work.dropna(subset=feature_cols + ['Power demand']).copy()
+    # Drop NA in-place to save memory
+    df_work.dropna(subset=feature_cols + ['Power demand'], inplace=True)
     
-    if df_clean.empty or len(df_clean) == 0:
+    if df_work.empty or len(df_work) == 0:
         raise ValueError(f'No valid data available after feature engineering. Required features: {feature_cols}')
     
     # Make predictions for all available data
-    X = df_clean[feature_cols]
+    X = df_work[feature_cols]
     X_scaled = _scaler.transform(X)
     preds = _model.predict(X_scaled)
     
-    df_result = df_clean[['Power demand']].copy()
-    df_result['Predicted demand'] = preds
+    # Create result efficiently
+    df_result = pd.DataFrame({
+        'Power demand': df_work['Power demand'],
+        'Predicted demand': preds
+    }, index=df_work.index)
     
     # Monthly aggregation for yearly view
     df_monthly = df_result.resample('MS').mean()  # Monthly Start
@@ -168,23 +200,30 @@ if page == "🏠 Home Page":
 elif page == "📊 Data Visualization":
     st.title("📊 Historical Data Insights & Analysis")
     
-    # Try to load full dataset first for seasonal analysis
-    df_full = load_full_data()
+    # Defer loading full data, first check precomputed data
     df_sample = load_data()
     
     if df_sample is not None:
         st.write("Sample of Cleaned Data:")
         st.dataframe(df_sample.head(10))
+        
+    seasonal_data = load_seasonal_data()
+    pred_monthly = load_yearly_comparison()
     
-    # Use full data for seasonal pattern if available, otherwise use sample
+    # Fallback to computing from full dataset if precomputed files are missing
+    df_full = None
+    if seasonal_data is None or pred_monthly is None:
+        df_full = load_full_data()
+        
     df_for_analysis = df_full if df_full is not None else df_sample
     
-    if df_for_analysis is not None:
-        st.markdown("---")
-        st.header("🌦️ Seasonal Pattern - Yearly Analysis")
-        st.markdown("**Monthly average power demand showing seasonal patterns across years.**")
-        
-        # Prepare data for seasonal analysis
+    # Draw Seasonal Pattern section
+    st.markdown("---")
+    st.header("🌦️ Seasonal Pattern - Yearly Analysis")
+    st.markdown("**Monthly average power demand showing seasonal patterns across years.**")
+    
+    if seasonal_data is None and df_for_analysis is not None:
+        # Prepare data for seasonal analysis on the fly
         df_analysis = df_for_analysis.copy()
         df_analysis['Year'] = df_analysis.index.year.astype(str)
         df_analysis['Month'] = df_analysis.index.month
@@ -194,6 +233,8 @@ elif page == "📊 Data Visualization":
         seasonal_data = df_analysis.groupby(['Year', 'Month'])['Power demand'].agg(['mean', 'min', 'max']).reset_index()
         seasonal_data['Month_Name'] = seasonal_data['Month'].map(lambda x: month_names[x-1])
         
+    if seasonal_data is not None:
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
         # Create line chart for seasonal patterns
         fig_seasonal = px.line(seasonal_data, 
                                x='Month', 
@@ -229,151 +270,158 @@ elif page == "📊 Data Visualization":
         }).round(2)
         summary_table.columns = ['Min Demand (MW)', 'Max Demand (MW)', 'Avg Demand (MW)']
         st.dataframe(summary_table, use_container_width=True)
+    else:
+        st.warning("⚠️ Seasonal data could not be loaded. Please ensure dataset or precomputed files exist.")
         
-        # === ACTUAL VS PREDICTED YEARLY ===
-        st.markdown("---")
-        st.header("🤖 Actual vs Predicted Demand - Yearly View")
-        st.markdown("**Comparing actual power demand with model predictions on a monthly basis across years.**")
-        
+    # === ACTUAL VS PREDICTED YEARLY ===
+    st.markdown("---")
+    st.header("🤖 Actual vs Predicted Demand - Yearly View")
+    st.markdown("**Comparing actual power demand with model predictions on a monthly basis across years.**")
+    
+    if pred_monthly is None:
         model, scaler, _ = load_models()
-        if model is not None and scaler is not None:
+        if model is not None and scaler is not None and df_for_analysis is not None:
             try:
                 pred_monthly = make_prediction_comparison_yearly(df_for_analysis, model, scaler)
-                
-                # Create line chart with both actual and predicted
-                fig_actual_pred = go.Figure()
-                
-                # Add actual demand line
-                fig_actual_pred.add_trace(go.Scatter(
-                    x=pred_monthly.index,
-                    y=pred_monthly['Power demand'],
-                    mode='lines+markers',
-                    name='Actual Demand',
-                    line=dict(color='#2ecc71', width=2.5),
-                    marker=dict(size=6),
-                    hovertemplate='<b>Actual</b><br>Date: %{x|%b %Y}<br>Demand: %{y:.1f} MW<extra></extra>'
-                ))
-                
-                # Add predicted demand line
-                fig_actual_pred.add_trace(go.Scatter(
-                    x=pred_monthly.index,
-                    y=pred_monthly['Predicted demand'],
-                    mode='lines+markers',
-                    name='Predicted Demand',
-                    line=dict(color='#e74c3c', width=2.5, dash='dash'),
-                    marker=dict(size=6),
-                    hovertemplate='<b>Predicted</b><br>Date: %{x|%b %Y}<br>Demand: %{y:.1f} MW<extra></extra>'
-                ))
-                
-                fig_actual_pred.update_layout(
-                    title='Actual vs Predicted Monthly Demand (Yearly View)',
-                    xaxis_title='Month',
-                    yaxis_title='Demand (MW)',
-                    height=500,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(240,240,240,0.5)',
-                    template='plotly_white',
-                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
-                )
-                
-                st.plotly_chart(fig_actual_pred, use_container_width=True)
-                
-                # Calculate and show metrics
-                st.markdown("---")
-                st.header("📈 Model Performance Metrics (Yearly Data)")
-                
-                rmse = np.sqrt(np.mean((pred_monthly['Power demand'] - pred_monthly['Predicted demand']) ** 2))
-                mae = np.mean(np.abs(pred_monthly['Power demand'] - pred_monthly['Predicted demand']))
-                residuals = pred_monthly['Power demand'] - pred_monthly['Predicted demand']
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("📊 RMSE", f"{rmse:.2f} MW")
-                with col2:
-                    st.metric("📏 MAE", f"{mae:.2f} MW")
-                with col3:
-                    mape = np.mean(np.abs(residuals / pred_monthly['Power demand'])) * 100
-                    st.metric("🎯 MAPE", f"{mape:.2f}%")
-                with col4:
-                    r2 = 1 - (np.sum(residuals**2) / np.sum((pred_monthly['Power demand'] - pred_monthly['Power demand'].mean())**2))
-                    st.metric("📈 R² Score", f"{r2:.4f}")
-                
-                # Explanation about why R² is higher
-                st.warning("""
-                📌 **Why is R² higher here than validation metrics?**
-                
-                - **Validation R² (XGBoost): 0.9468** - Calculated on individual 5-minute intervals
-                - **Yearly R² (shown above): Often >0.99** - Calculated on monthly aggregated averages
-                
-                **Reason:** Monthly averaging smooths out noise and reduces variance in the data. Predicting smooth monthly averages is easier than predicting individual volatile 5-minute intervals.
-                
-                **True Model Performance:** The validation set metrics (RMSE, MAE, R²) are more representative of real-world performance on raw data.
-                """)
-                
-                # === 2024 MONTHLY FORECAST ===
-                st.markdown("---")
-                st.header("📅 2024 Monthly Forecast - Actual vs Predicted")
-                st.markdown("**Monthly average power demand for 2024 with model predictions vs actual recorded values.**")
-                
-                if os.path.exists('monthly_actual_vs_predicted_2024.png'):
-                    from PIL import Image
-                    img = Image.open('monthly_actual_vs_predicted_2024.png')
-                    st.image(img, use_column_width=True, caption="Monthly Actual vs Predicted Power Demand - 2024")
-                    
-                    # Display 2024 metrics
-                    st.markdown("---")
-                    st.subheader("📊 2024 Forecast Performance Summary")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("🎯 MAE (2024)", "67.21 MW")
-                    with col2:
-                        st.metric("📊 RMSE (2024)", "73.83 MW")
-                    with col3:
-                        st.metric("✅ MAPE (2024)", "1.49%")
-                    
-                    st.info("""
-                    ℹ️ **Note on 2024 Performance Metrics:**
-                    - These metrics are on **monthly aggregated data** (12 data points total)
-                    - This is different from **validation set metrics** which use raw 5-minute intervals (~90K points)
-                    - Aggregated monthly performance is inherently easier to predict than volatile minute-level data
-                    - Compare with **Validation R² (XGBoost): 0.9468** on raw data for true model performance
-                    """)
-                    
-                    # Monthly breakdown table
-                    st.markdown("---")
-                    st.subheader("📋 Month-by-Month Breakdown (2024)")
-                    
-                    months_data = {
-                        'Month': ['January', 'February', 'March', 'April', 'May', 'June', 
-                                 'July', 'August', 'September', 'October', 'November', 'December'],
-                        'Actual (MW)': [4002.89, 3541.57, 3557.99, 4223.68, 5543.26, 5590.68,
-                                       5377.00, 4878.87, 4620.07, 4138.03, 3525.38, 4403.54],
-                        'Predicted (MW)': [3915.13, 3484.90, 3520.99, 4191.44, 5439.54, 5456.09,
-                                          5295.31, 4837.89, 4567.71, 4105.46, 3463.51, 4318.52],
-                        'Difference (MW)': [87.77, 56.68, 37.01, 32.24, 103.72, 134.59,
-                                           81.70, 40.97, 52.36, 32.57, 61.88, 85.02]
-                    }
-                    df_2024_breakdown = pd.DataFrame(months_data)
-                    
-                    # Highlight rows
-                    def highlight_diff(row):
-                        if row['Difference (MW)'] > 100:
-                            return ['background-color: #fff3cd'] * len(row)
-                        elif row['Difference (MW)'] < 40:
-                            return ['background-color: #d4edda'] * len(row)
-                        return [''] * len(row)
-                    
-                    st.dataframe(df_2024_breakdown.style.apply(highlight_diff, axis=1),
-                                use_container_width=True)
-                    
-                    st.caption("🟡 Yellow = Higher deviation (>100 MW) | 🟢 Green = Lower error (<40 MW)")
-                else:
-                    st.info("📌 2024 monthly forecast graph not yet generated. Run the monthly_forecast_2024.py script to create it.")
-                
             except Exception as e:
                 st.error(f"⚠️ Could not generate yearly comparison chart: {str(e)}")
                 st.info("💡 This may happen if the dataset doesn't have enough valid records after feature engineering. Try refreshing the page or check that all data files are present.")
+                
+    if pred_monthly is not None:
+        try:
+            # Create line chart with both actual and predicted
+            fig_actual_pred = go.Figure()
+            
+            # Add actual demand line
+            fig_actual_pred.add_trace(go.Scatter(
+                x=pred_monthly.index,
+                y=pred_monthly['Power demand'],
+                mode='lines+markers',
+                name='Actual Demand',
+                line=dict(color='#2ecc71', width=2.5),
+                marker=dict(size=6),
+                hovertemplate='<b>Actual</b><br>Date: %{x|%b %Y}<br>Demand: %{y:.1f} MW<extra></extra>'
+            ))
+            
+            # Add predicted demand line
+            fig_actual_pred.add_trace(go.Scatter(
+                x=pred_monthly.index,
+                y=pred_monthly['Predicted demand'],
+                mode='lines+markers',
+                name='Predicted Demand',
+                line=dict(color='#e74c3c', width=2.5, dash='dash'),
+                marker=dict(size=6),
+                hovertemplate='<b>Predicted</b><br>Date: %{x|%b %Y}<br>Demand: %{y:.1f} MW<extra></extra>'
+            ))
+            
+            fig_actual_pred.update_layout(
+                title='Actual vs Predicted Monthly Demand (Yearly View)',
+                xaxis_title='Month',
+                yaxis_title='Demand (MW)',
+                height=500,
+                hovermode='x unified',
+                plot_bgcolor='rgba(240,240,240,0.5)',
+                template='plotly_white',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+            )
+            
+            st.plotly_chart(fig_actual_pred, use_container_width=True)
+            
+            # Calculate and show metrics
+            st.markdown("---")
+            st.header("📈 Model Performance Metrics (Yearly Data)")
+            
+            rmse = np.sqrt(np.mean((pred_monthly['Power demand'] - pred_monthly['Predicted demand']) ** 2))
+            mae = np.mean(np.abs(pred_monthly['Power demand'] - pred_monthly['Predicted demand']))
+            residuals = pred_monthly['Power demand'] - pred_monthly['Predicted demand']
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("📊 RMSE", f"{rmse:.2f} MW")
+            with col2:
+                st.metric("📏 MAE", f"{mae:.2f} MW")
+            with col3:
+                mape = np.mean(np.abs(residuals / pred_monthly['Power demand'])) * 100
+                st.metric("🎯 MAPE", f"{mape:.2f}%")
+            with col4:
+                r2 = 1 - (np.sum(residuals**2) / np.sum((pred_monthly['Power demand'] - pred_monthly['Power demand'].mean())**2))
+                st.metric("📈 R² Score", f"{r2:.4f}")
+            
+            # Explanation about why R² is higher
+            st.warning("""
+            📌 **Why is R² higher here than validation metrics?**
+            
+            - **Validation R² (XGBoost): 0.9468** - Calculated on individual 5-minute intervals
+            - **Yearly R² (shown above): Often >0.99** - Calculated on monthly aggregated averages
+            
+            **Reason:** Monthly averaging smooths out noise and reduces variance in the data. Predicting smooth monthly averages is easier than predicting individual volatile 5-minute intervals.
+            
+            **True Model Performance:** The validation set metrics (RMSE, MAE, R²) are more representative of real-world performance on raw data.
+            """)
+            
+            # === 2024 MONTHLY FORECAST ===
+            st.markdown("---")
+            st.header("📅 2024 Monthly Forecast - Actual vs Predicted")
+            st.markdown("**Monthly average power demand for 2024 with model predictions vs actual recorded values.**")
+            
+            if os.path.exists('monthly_actual_vs_predicted_2024.png'):
+                from PIL import Image
+                img = Image.open('monthly_actual_vs_predicted_2024.png')
+                st.image(img, use_column_width=True, caption="Monthly Actual vs Predicted Power Demand - 2024")
+                
+                # Display 2024 metrics
+                st.markdown("---")
+                st.subheader("📊 2024 Forecast Performance Summary")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("🎯 MAE (2024)", "67.21 MW")
+                with col2:
+                    st.metric("📊 RMSE (2024)", "73.83 MW")
+                with col3:
+                    st.metric("✅ MAPE (2024)", "1.49%")
+                
+                st.info("""
+                ℹ️ **Note on 2024 Performance Metrics:**
+                - These metrics are on **monthly aggregated data** (12 data points total)
+                - This is different from **validation set metrics** which use raw 5-minute intervals (~90K points)
+                - Aggregated monthly performance is inherently easier to predict than volatile minute-level data
+                - Compare with **Validation R² (XGBoost): 0.9468** on raw data for true model performance
+                """)
+                
+                # Monthly breakdown table
+                st.markdown("---")
+                st.subheader("📋 Month-by-Month Breakdown (2024)")
+                
+                months_data = {
+                    'Month': ['January', 'February', 'March', 'April', 'May', 'June', 
+                             'July', 'August', 'September', 'October', 'November', 'December'],
+                    'Actual (MW)': [4002.89, 3541.57, 3557.99, 4223.68, 5543.26, 5590.68,
+                                   5377.00, 4878.87, 4620.07, 4138.03, 3525.38, 4403.54],
+                    'Predicted (MW)': [3915.13, 3484.90, 3520.99, 4191.44, 5439.54, 5456.09,
+                                      5295.31, 4837.89, 4567.71, 4105.46, 3463.51, 4318.52],
+                    'Difference (MW)': [87.77, 56.68, 37.01, 32.24, 103.72, 134.59,
+                                       81.70, 40.97, 52.36, 32.57, 61.88, 85.02]
+                }
+                df_2024_breakdown = pd.DataFrame(months_data)
+                
+                # Highlight rows
+                def highlight_diff(row):
+                    if row['Difference (MW)'] > 100:
+                        return ['background-color: #fff3cd'] * len(row)
+                    elif row['Difference (MW)'] < 40:
+                        return ['background-color: #d4edda'] * len(row)
+                    return [''] * len(row)
+                
+                st.dataframe(df_2024_breakdown.style.apply(highlight_diff, axis=1),
+                            use_container_width=True)
+                
+                st.caption("🟡 Yellow = Higher deviation (>100 MW) | 🟢 Green = Lower error (<40 MW)")
+            else:
+                st.info("📌 2024 monthly forecast graph not yet generated. Run the monthly_forecast_2024.py script to create it.")
+        except Exception as e:
+            st.error(f"⚠️ Could not generate yearly comparison chart: {str(e)}")
+            st.info("💡 This may happen if the dataset doesn't have enough valid records after feature engineering. Try refreshing the page or check that all data files are present.")
         
     elif df_sample is not None:
         st.markdown("---")

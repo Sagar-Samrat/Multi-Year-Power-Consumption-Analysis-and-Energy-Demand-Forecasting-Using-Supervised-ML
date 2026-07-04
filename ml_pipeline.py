@@ -186,12 +186,50 @@ def generate_viva_eda_graphs(df, model, model_name, X_test, y_test, features):
     
     print("✅ Logical EDA Viva Graphs successfully saved as PNG files!")
 
+def precompute_dashboard_data(df, model):
+    """
+    Step 7: Precompute heavy dashboard datasets to prevent memory-limit 503 errors on hosting platforms.
+    """
+    print("Precomputing dashboard summary files...")
+    # 1. Seasonal patterns
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    seasonal_data = df.groupby(['year', 'month'])['Power demand'].agg(['mean', 'min', 'max']).reset_index()
+    seasonal_data.rename(columns={'year': 'Year', 'month': 'Month'}, inplace=True)
+    seasonal_data['Year'] = seasonal_data['Year'].astype(str)
+    seasonal_data['Month_Name'] = seasonal_data['Month'].map(lambda x: month_names[x-1])
+    seasonal_data.to_csv("seasonal_data_precomputed.csv", index=False)
+    print("✅ Precomputed seasonal patterns saved to 'seasonal_data_precomputed.csv'.")
+    
+    # Load scaler
+    scaler = joblib.load('scaler.pkl')
+    
+    # 2. Yearly actual vs predicted comparison
+    feature_cols = ['temp', 'rhum', 'wspd', 'hour', 'day', 'month', 'weekday', 'lag_24', 'lag_288', 'rolling_mean_12']
+    X = df[feature_cols]
+    X_scaled = scaler.transform(X)
+    preds = model.predict(X_scaled)
+    
+    df_result = pd.DataFrame({
+        'Power demand': df['Power demand'],
+        'Predicted demand': preds
+    }, index=df.index)
+    
+    df_monthly = df_result.resample('MS').mean()
+    df_monthly['Year'] = df_monthly.index.year
+    df_monthly['Month'] = df_monthly.index.month
+    df_monthly['Month_Num'] = df_monthly.index.strftime('%b')
+    df_monthly.to_csv("yearly_monthly_comparison.csv")
+    print("✅ Precomputed predictions comparison saved to 'yearly_monthly_comparison.csv'.")
+
 def main():
     """Main execution function triggered when the script runs."""
     filepath = "/Users/sagarsamrat/Downloads/powerdemand_5min_2021_to_2024_with weather.csv"
     if not os.path.exists(filepath):
-        print("Data file not found. Please check filepath.")
-        return
+        # Fallback to local path if Downloads path doesn't exist
+        filepath = "powerdemand_5min_2021_to_2024_with weather.csv"
+        if not os.path.exists(filepath):
+            print("Data file not found. Please check filepath.")
+            return
     
     # 1. Pipeline Execution
     print("Executing ML Pipeline...")
@@ -208,6 +246,9 @@ def main():
     
     # 4. Logical EDA Graph generation for Viva Presentation
     generate_viva_eda_graphs(df, best_model, best_name, X_test, y_test, features)
+    
+    # 5. Precompute Dashboard Datasets to avoid OOM in Streamlit
+    precompute_dashboard_data(df, best_model)
     
     print(f"✅ Pipeline Completed! The winning model was: {best_name}")
 
